@@ -8,7 +8,7 @@ import wandb
 from tqdm.auto import trange
 
 
-DESC_TEMPLATE = 'Desc loss: adv {:.3f} gp {:.3f} Gen loss: adv {:.3f} rec {:.3f} fm {:.3f}'
+DESC_TEMPLATE = 'Critic loss: adv {:.3f} gp {:.3f} Gen loss: adv {:.3f} rec {:.3f} fm {:.3f}'
 
 
 class ResidualBlock(nn.Module):
@@ -16,15 +16,15 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.main_path = nn.Sequential(
             nn.Conv2d(in_dim, int_dim, 3, padding=1),
-            nn.BatchNorm2d(int_dim),
+            nn.InstanceNorm2d(int_dim),
             nn.PReLU(),
             nn.Conv2d(int_dim, out_dim, 3, padding=1),
-            nn.BatchNorm2d(out_dim)
+            nn.InstanceNorm2d(out_dim)
         )
         self.shortcut = nn.Identity() if in_dim == out_dim \
             else nn.Sequential(
                 nn.Conv2d(in_dim, out_dim, 1),
-                nn.BatchNorm2d(out_dim)
+                nn.InstanceNorm2d(out_dim)
             )
         self.final_activation = nn.PReLU()
 
@@ -40,17 +40,17 @@ class Generator(nn.Module):
             nn.MaxPool2d(2),
             ResidualBlock(16, 32, 64),
             nn.MaxPool2d(2),
-            ResidualBlock(64, 128, 256),
+            ResidualBlock(64, 128, 128),
             nn.MaxPool2d(2),
-            ResidualBlock(256, 512, 1024),
-            nn.MaxPool2d(2)
+            # ResidualBlock(256, 512, 512),
+            # nn.MaxPool2d(2)
         )
-        self.bottleneck = ResidualBlock(1024, 1024, 1024)
+        self.bottleneck = ResidualBlock(128, 128, 128)
         self.decoder = nn.Sequential(
+            # nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # ResidualBlock(256, 128),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            ResidualBlock(1024, 512, 256),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            ResidualBlock(256, 128, 64),
+            ResidualBlock(128, 128, 64),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             ResidualBlock(64, 32, 16),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
@@ -82,7 +82,7 @@ def make_down_block(in_dim: int, int_dim: int, out_dim: int):
 
 def make_up_block(in_dim: int, int_dim: int, out_dim: int):
     return nn.ModuleList([
-        nn.Upsample(scale_factor=2),
+        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
         ResidualBlock(in_dim, int_dim, out_dim)
     ])
 
@@ -96,7 +96,6 @@ class UNetGenerator(nn.Module):
             make_down_block(64, 128, 128),
             make_down_block(128, 256, 256)
         ])
-        self.bottleneck = ResidualBlock(256, 256, 256)
         self.bottleneck = ResidualBlock(256, 256, 256)
         self.up_path = nn.ModuleList([
             make_up_block(512, 256, 128),
@@ -144,18 +143,18 @@ class Critic(nn.Module):
             nn.MaxPool2d(2),
             ResidualBlock(32, 64, 128),
             nn.MaxPool2d(2),
-            ResidualBlock(128, 256, 512),
+            ResidualBlock(128, 128, 128),
             nn.MaxPool2d(2),
-            ResidualBlock(512, 1024, 1024),
-            nn.MaxPool2d(2),
-            nn.Conv2d(1024, 512, 1),
+#             ResidualBlock(512, 512, 512),
+#             nn.MaxPool2d(2),
+            nn.Conv2d(128, 128, 1),
             nn.Sigmoid(),
         )
         self.final_clf = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(),
-            nn.Linear(512, 1),
+#             nn.Linear(256, 256),
+#             nn.BatchNorm1d(256),
+#             nn.LeakyReLU(),
+            nn.Linear(128, 1),
             nn.Sigmoid()
         )
 
@@ -167,7 +166,7 @@ class Critic(nn.Module):
         attention = self.feature_layers(x).sum(dim=1)
         attention /= attention.max(dim=2)[0].max(dim=1)[0].unsqueeze(1).unsqueeze(2)
         attention = attention.unsqueeze(1)
-        attention = F.interpolate(attention, scale_factor=16)
+        attention = F.interpolate(attention, scale_factor=8)
         return x * attention
 
 
@@ -196,15 +195,14 @@ def make_wandb_samples(dl, conv_func, device):
 
 
 class SPAGAN:
-    def __init__(self, lambda_fm=1., lambda_rec=10., lambda_gp=10.):
+    def __init__(self, lambda_fm=1., lambda_rec=10., lambda_gp=10., direct_rec_weight=.3, gen_type=UNetGenerator):
         self.lambda_fm = lambda_fm
         self.lambda_rec = lambda_rec
         self.lambda_gp = lambda_gp
+        self.direct_rec_weight = direct_rec_weight
         self.device = 'cpu'
-        # self.g_a = Generator()
-        self.g_a = UNetGenerator()
-        # self.g_b = Generator()
-        self.g_b = UNetGenerator()
+        self.g_a = gen_type()
+        self.g_b = gen_type()
         self.d_a = Critic()
         self.d_b = Critic()
 
@@ -252,7 +250,7 @@ class SPAGAN:
         loss_g_a_adv = F.binary_cross_entropy(critic_out_a, critic_tgt_a)
         loss_g_b_adv = F.binary_cross_entropy(critic_out_b, critic_tgt_b)
         loss_gen_rec = torch.abs(images_a - rest_a).mean() + torch.abs(images_b - rest_b).mean() + \
-            torch.abs(self.a2b(images_b) - images_b).mean() + torch.abs(self.b2a(images_a) - images_a).mean()
+            self.direct_rec_weight * (torch.abs(self.a2b(images_b) - images_b).mean() + torch.abs(self.b2a(images_a) - images_a).mean())
         loss_fm = SPAGAN.calc_fm_loss(images_a, conv_b, self.d_a, self.g_a) + \
             SPAGAN.calc_fm_loss(images_b, conv_a, self.d_b, self.g_b)
 
