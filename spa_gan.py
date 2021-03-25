@@ -143,18 +143,18 @@ class Critic(nn.Module):
             nn.MaxPool2d(2),
             ResidualBlock(32, 64, 128),
             nn.MaxPool2d(2),
-            ResidualBlock(128, 128, 128),
+            ResidualBlock(128, 128, 256),
             nn.MaxPool2d(2),
-#             ResidualBlock(512, 512, 512),
-#             nn.MaxPool2d(2),
-            nn.Conv2d(128, 128, 1),
+            ResidualBlock(256, 512, 512),
+            nn.MaxPool2d(2),
+            nn.Conv2d(512, 512, 1),
             nn.Sigmoid(),
         )
         self.final_clf = nn.Sequential(
 #             nn.Linear(256, 256),
 #             nn.BatchNorm1d(256),
 #             nn.LeakyReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(512, 1),
             nn.Sigmoid()
         )
 
@@ -166,7 +166,7 @@ class Critic(nn.Module):
         attention = self.feature_layers(x).sum(dim=1)
         attention /= attention.max(dim=2)[0].max(dim=1)[0].unsqueeze(1).unsqueeze(2)
         attention = attention.unsqueeze(1)
-        attention = F.interpolate(attention, scale_factor=8)
+        attention = F.interpolate(attention, scale_factor=16)
         return x * attention
 
 
