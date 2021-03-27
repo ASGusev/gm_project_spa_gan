@@ -91,20 +91,23 @@ class UNetGenerator(nn.Module):
     def __init__(self):
         super().__init__()
         self.down_path = nn.ModuleList([
-            make_down_block(3, 16, 32),
-            make_down_block(32, 64, 64),
+            make_down_block(3, 32, 64),
             make_down_block(64, 128, 128),
-            make_down_block(128, 256, 256)
+            make_down_block(128, 256, 256),
+            make_down_block(256, 512, 512)
         ])
-        self.bottleneck = ResidualBlock(256, 256, 256)
+        self.bottleneck = nn.Sequential(
+            ResidualBlock(512, 512, 512),
+            ResidualBlock(512, 512, 512)
+        )
         self.up_path = nn.ModuleList([
+            make_up_block(1024, 512, 256),
             make_up_block(512, 256, 128),
             make_up_block(256, 128, 64),
-            make_up_block(128, 64, 32),
-            make_up_block(64, 32, 4)
+            make_up_block(128, 64, 32)
         ])
         self.final_layer = nn.Sequential(
-            nn.Conv2d(4, 3, 3, padding=1),
+            nn.Conv2d(32, 3, 3, padding=1),
             nn.Sigmoid()
         )
 
@@ -145,15 +148,13 @@ class Critic(nn.Module):
             nn.MaxPool2d(2),
             ResidualBlock(128, 128, 256),
             nn.MaxPool2d(2),
-            ResidualBlock(256, 512, 512),
+            ResidualBlock(256, 256, 512),
             nn.MaxPool2d(2),
             nn.Conv2d(512, 512, 1),
             nn.Sigmoid(),
         )
         self.final_clf = nn.Sequential(
-#             nn.Linear(256, 256),
-#             nn.BatchNorm1d(256),
-#             nn.LeakyReLU(),
+            nn.Dropout(0.2),
             nn.Linear(512, 1),
             nn.Sigmoid()
         )
@@ -237,6 +238,23 @@ class SPAGAN:
         self.d_b.to(device)
         return self
 
+    def save(self, path):
+        path.mkdir()
+        torch.save(self.g_a.state_dict(), path / 'g_a.pt')
+        torch.save(self.g_b.state_dict(), path / 'g_b.pt')
+        torch.save(self.d_a.state_dict(), path / 'd_a.pt')
+        torch.save(self.d_b.state_dict(), path / 'd_b.pt')
+
+    def load(self, path):
+        self.g_a.load_state_dict(torch.load(path / 'g_a.pt', map_location='cpu'))
+        self.g_b.load_state_dict(torch.load(path / 'g_b.pt', map_location='cpu'))
+        self.d_a.load_state_dict(torch.load(path / 'd_a.pt', map_location='cpu'))
+        self.d_b.load_state_dict(torch.load(path / 'd_b.pt', map_location='cpu'))
+        self.g_a.to(self.device)
+        self.g_b.to(self.device)
+        self.d_a.to(self.device)
+        self.d_b.to(self.device)
+
     def calc_gen_loss(self, images_a, images_b):
         conv_a = self.a2b(images_a)
         rest_a = self.b2a(conv_a)
@@ -281,12 +299,19 @@ class SPAGAN:
         fm_loss = np.mean(fm_losses)
         return desc_adv_loss, desc_gp_loss, gen_adv_loss, rec_loss, fm_loss
 
+    def set_train(self, val):
+        self.d_a.train(val)
+        self.d_b.train(val)
+        self.g_a.train(val)
+        self.g_b.train(val)
+
     def train(self, dl_train_a, dl_train_b, dl_val_a, dl_val_b, n_epochs, lr_critic, lr_gen):
         opt_g = torch.optim.Adam(chain(self.g_a.parameters(), self.g_b.parameters()), lr_gen)
         opt_d = torch.optim.Adam(chain(self.d_a.parameters(), self.d_b.parameters()), lr_critic)
         progress_bar = trange(n_epochs)
         for _ in progress_bar:
             desc_adv_losses, desc_gp_losses, gen_adv_losses, gen_rec_losses, fm_losses = [], [], [], [], []
+            self.set_train(True)
             for (images_a,), (images_b,) in zip(dl_train_a, dl_train_b):
                 images_a, images_b = images_a.to(self.device), images_b.to(self.device)
 
@@ -315,6 +340,7 @@ class SPAGAN:
             train_gen_adv_loss = np.mean(gen_adv_losses)
             train_rec_loss = np.mean(gen_rec_losses)
             train_fm_loss = np.mean(fm_losses)
+            self.set_train(False)
 
             val_critic_adv_loss, val_gp_loss, val_gen_adv_loss, val_rec_loss, val_fm_loss = \
                 self.evaluate(dl_val_a, dl_val_b)
